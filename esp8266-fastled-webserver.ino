@@ -31,15 +31,14 @@ extern "C" {
 #include "GradientPalettes.h"
 #include "wifiSettings.h"
 
+//IR Reciever Setup
 #define RECV_PIN 12
 IRrecv irReceiver(RECV_PIN);
-
 #include "Commands.h"
 
 //Wifi settings moved to wifiSettings.h
 
-ESP8266WebServer server(80);
-
+//Define RGB LED configuration
 #define DATA_PIN      2     // for Huzzah: Pins w/o special function:  #4, #5, #12, #13, #14; // #16 does not work :(
 #define LED_TYPE      WS2812
 #define COLOR_ORDER   RGB
@@ -47,21 +46,24 @@ ESP8266WebServer server(80);
 
 #define MILLI_AMPS         2000     // IMPORTANT: set here the max milli-Amps of your power supply 5V 2A = 2000
 #define FRAMES_PER_SECOND  120 // here you can control the speed. With the Access Point / Web Server the animations run a bit slower.
+#define ARRAY_SIZE(A) (sizeof(A) / sizeof((A)[0]))
+#define SECONDS_PER_PALETTE 10
+
+#define UTCAdj -5 //This is the adjustment from UTC time, this wil change depending on your time zone and weather it's daylight savings time.  
+                  //For EST (New York / Eastern Standard Time) when it is not in Daylight savings time, like around christmas, the value is -5, PST (California) would be -8, you can work it out from there.
+#define TURN_ON_HOUR  17     //Hour (from 0 to 23) to activate the lights, this is in military time, so 5PM would be 17 (5 + 12)
+#define TURN_OFF_HOUR  23   //Hour (from 0 to 23) to deactivate the lights
+#define POWER_ON_STATE  0   //0 means when the ESP8266 is powered on, the lights stay off, 1 means they turn on.  THis state will persist until the next hour rolls over, then the schedule above is honored.
 
 CRGB leds[NUM_LEDS];
+ESP8266WebServer server(80);
 
 uint8_t patternIndex = 0;
-
 const uint8_t brightnessCount = 5;
 uint8_t brightnessMap[brightnessCount] = { 16, 32, 64, 128, 255 };
 int brightnessIndex = 0;
 uint8_t brightness = brightnessMap[brightnessIndex];
 
-#define ARRAY_SIZE(A) (sizeof(A) / sizeof((A)[0]))
-
-// ten seconds per color palette makes a good demo
-// 20-120 is better for deployment
-#define SECONDS_PER_PALETTE 10
 
 ///////////////////////////////////////////////////////////////////////
 
@@ -73,10 +75,8 @@ extern const uint8_t gGradientPaletteCount;
 
 // Current palette number from the 'playlist' of color palettes
 uint8_t gCurrentPaletteNumber = 0;
-
 CRGBPalette16 gCurrentPalette( CRGB::Black);
 CRGBPalette16 gTargetPalette( gGradientPalettes[0] );
-
 
 // Gradient palette "fire", originally from
 // http://soliton.vm.bytemark.co.uk/pub/cpt-city/neota/elem/tn/fire.png.index.html
@@ -104,12 +104,38 @@ uint8_t gHue = 0; // rotating "base color" used by many of the patterns
 
 CRGB solidColor = CRGB::Blue;
 
-uint8_t power = 1;
+uint8_t power = POWER_ON_STATE;
+
+
+
+/*Keep Time*/
+//Written by Ruben Marc Speybrouck - updated by Jeremy Proffitt
+const char* host = "time.nist.gov"; // Round-robin DAYTIME protocol
+
+unsigned long timeNow = 0;
+unsigned long timeLast = 0;
+
+//Time start Settings:
+int startingHour = 12; // set your starting hour here, not below at int hour. This ensures accurate daily correction of time
+
+int seconds = 0;
+int minutes = 33;
+int hours = startingHour;
+int days = 0;
+/*Keep Time*/
+bool initialTimeUpdated = false;
+String TimeStr = "";
+
+int lastHourCompared = 0;  //We use this to allow you to turn on the lights and not have the auto on/off kick in till the change of the hour.
+
 
 void setup(void) {
   Serial.begin(115200);
   delay(100);
   Serial.setDebugOutput(true);
+
+  initialTimeUpdated = updateTimeFromInternet();
+  
 
   FastLED.addLeds<LED_TYPE, DATA_PIN, COLOR_ORDER>(leds, NUM_LEDS);         // for WS2812 (Neopixel)
   //FastLED.addLeds<LED_TYPE,DATA_PIN,CLK_PIN,COLOR_ORDER>(leds, NUM_LEDS); // for APA102 (Dotstar)
@@ -123,7 +149,7 @@ void setup(void) {
   loadSettings();
 
   irReceiver.enableIRIn(); // Start the receiver
-
+/*
   Serial.println();
   Serial.print( F("Heap: ") ); Serial.println(system_get_free_heap_size());
   Serial.print( F("Boot Vers: ") ); Serial.println(system_get_boot_version());
@@ -134,7 +160,7 @@ void setup(void) {
   Serial.print( F("Flash Size: ") ); Serial.println(ESP.getFlashChipRealSize());
   Serial.print( F("Vcc: ") ); Serial.println(ESP.getVcc());
   Serial.println();
-
+*/
   SPIFFS.begin();
   {
     Dir dir = SPIFFS.openDir("/");
@@ -268,6 +294,12 @@ void setup(void) {
   Serial.println("HTTP server started");
 
   autoPlayTimeout = millis() + (autoPlayDurationSeconds * 1000);
+
+  if (POWER_ON_STATE == 1)  //If we are turning the lights on till the next hour, then skip on/off comparison for this hour.
+  {
+    lastHourCompared = hours;
+  }
+
 }
 
 typedef void (*Pattern)();
@@ -295,10 +327,40 @@ PatternAndNameList patterns = {
 
 const uint8_t patternCount = ARRAY_SIZE(patterns);
 
+
 void loop(void) {
   // Add entropy to random number generator; we use a lot of it.
   random16_add_entropy(random(65535));
+  //Update Time, keep trying to update from the internet until sucessful on turn on.
+  if (initialTimeUpdated == false) 
+  {
+    initialTimeUpdated = updateTimeFromInternet();
+  }
+  updateTime();
 
+  if (lastHourCompared != hours) {
+    lastHourCompared = hours;
+    power = 0; //start with the lights off, then apply the schedule
+    if (hours >= TURN_ON_HOUR && hours <= TURN_OFF_HOUR)
+    {
+      power = 1;
+    }
+  }
+
+  String compareTimeStr = "Time ";
+  compareTimeStr += hours;
+  compareTimeStr += ":";
+  compareTimeStr += minutes;
+  compareTimeStr += ":";
+  compareTimeStr += seconds;  
+
+  if (TimeStr != compareTimeStr) {
+    TimeStr = compareTimeStr;
+    Serial.println(TimeStr);
+  }
+  
+  
+  
   server.handleClient();
 
   handleIrInput();
@@ -944,5 +1006,99 @@ void palettetest()
   static uint8_t startindex = 0;
   startindex--;
   fill_palette( leds, NUM_LEDS, startindex, (256 / NUM_LEDS) + 1, gCurrentPalette, 255, LINEARBLEND);
+}
+
+void updateTime() {
+  timeNow = millis()/1000; // the number of milliseconds that have passed since boot
+  
+  seconds = timeNow - timeLast;//the number of seconds that have passed since the last time 60 seconds was reached.
+  
+  if (seconds >= 60)   //Add seconds.
+  {   
+    timeLast = timeNow;
+    minutes++;
+  } 
+
+  if (minutes  >= 60)  // if one hour has passed, start counting minutes from zero and add one hour to the clock
+  { 
+    minutes = 0;
+    hours++;
+    //updateTimeFromInternet();
+  }
+  
+  if (hours >= 24) //if 24 hours have passed , add one day
+  {
+    hours = 0;
+    days++;
+    updateTimeFromInternet();
+  }
+}
+
+bool updateTimeFromInternet() {
+  WiFiClient client;
+  const int httpPort = 13;
+  String TimeDate = "";
+  if (!client.connect(host, httpPort)) {
+    Serial.println("connection to time server failed");
+    return false;
+  }
+
+  Serial.println(">Sending Header<");
+  
+  // This will send the request to the server
+  client.print("HEAD / HTTP/1.1\r\nAccept: */*\r\nUser-Agent: Mozilla/4.0 (compatible; ESP8266 NodeMcu Lua;)\r\n\r\n");
+
+  delay(100);
+
+  // Read all the lines of the reply from server and print them to Serial
+  // expected line is like : Date: Thu, 01 Jan 2015 22:00:14 GMT
+  char buffer[12];
+  String dateTime = "";
+  String h = "";
+  String m = "";
+  Serial.println(">  Listening...<");
+
+  while(client.available())
+  {
+    Serial.println("Time Client Responding");
+    String line = client.readStringUntil('\r');
+    Serial.println(line);
+    if (line.indexOf("Date") != -1)
+    {
+      
+    } else
+    {
+      // Serial.print(line);
+      // date starts at pos 7
+      //TimeDate = line.substring(7);
+      //Serial.println(TimeDate);
+      // time starts at pos 14
+      h = line.substring(16, 18);
+      m = line.substring(19, 21);
+      hours = h.toInt();
+      minutes = m.toInt();
+      
+      /*TimeDate.replace(":","");
+      Serial.println(TimeDate);
+      hours = TimeDate.substring(0,2).toInt();
+      minutes = TimeDate.substring(2,2).toInt();
+      Serial.println("Minutes SubString");
+      Serial.println(TimeDate);
+      Serial.println(TimeDate.substring(1,3));*/
+      hours = hours - 5; //utc adjust for etc
+      if (hours < 0) //if we cross over to yesterday, then adjust the hour and day.
+      { 
+        hours = hours + 24;
+        days--; 
+      }
+
+      //minutes += 30;
+      
+      Serial.println(hours);
+      Serial.println(minutes);
+      return true;
+    }
+  }
+  return false;
 }
 
