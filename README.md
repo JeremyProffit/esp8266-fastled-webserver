@@ -1,3 +1,7 @@
+This is a fork of the popular ESP8266 + Fast LED Web server for my wifi candles, instructable found here:
+
+https://www.instructables.com/id/Garage-Door-Wifi-LED-Candles/
+
 FastLED + ESP8266 Web Server
 =========
 
